@@ -1,33 +1,40 @@
-from mpmath import si
+"""Gaussian Primitives for Slice-to-Volume Reconstruction (GSVR).
+
+Implements a 3D Gaussian splatting model for fetal MRI super-resolution
+reconstruction from thick-slice 2D acquisitions. The model represents the
+volume as a set of anisotropic 3D Gaussians with learnable positions, scales,
+rotations, and intensities, and supports inter-slice motion correction.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 import nibabel as nib
 import os
 import time
-from sympy import Q
 import torch
 import torch.nn as nn
 import faiss
 import random
-import faiss.contrib.torch_utils # important so that faiss can use torch tensors
+import faiss.contrib.torch_utils
 import scipy.ndimage as ndi
 import warnings
 import ants
 import math
+
+from profiling import PipelineProfiler
+
 # Suppress the specific internal warning from torch.compile
 warnings.filterwarnings("ignore", message=".*torch._prims_common.check.*")
 warnings.filterwarnings("ignore", message=".*Please use the new API settings to control TF32.*")
 
 torch.set_float32_matmul_precision('high')
 
-# OUTPUT_DIR = '/data_ssd/users/danneckm/GaussianSplatting/output'
 
 @torch.compile(mode="reduce-overhead")
 def fused_mahalanobis_distance(sigmas_nk, x_minus_mu_nk):
     """
     Computes v^T * Sigma^-1 * v for batch N, K.
     Fuses 3x3 inversion and matrix multiplication into one kernel.
-    
+
     sigmas_nk: (N, K, 3, 3) - The covariance matrices (including PSF)
     x_minus_mu_nk: (N, K, 3) - The centered coordinates
     """
@@ -36,31 +43,17 @@ def fused_mahalanobis_distance(sigmas_nk, x_minus_mu_nk):
     a = sigmas_nk[..., 0, 0]
     b = sigmas_nk[..., 0, 1]
     c = sigmas_nk[..., 0, 2]
-    # d = sigmas_nk[..., 1, 0] # Sym: d=b
     e = sigmas_nk[..., 1, 1]
     f = sigmas_nk[..., 1, 2]
-    # g = sigmas_nk[..., 2, 0] # Sym: g=c
-    h = sigmas_nk[..., 2, 1] # Sym: h=f
+    h = sigmas_nk[..., 2, 1]
     i = sigmas_nk[..., 2, 2]
 
     # 2. Compute Determinant (Sarrus Rule)
-    # det = a(ei - fh) - b(di - fg) + c(dh - eg)
     # utilizing symmetry where d=b, g=c, h=f
     det = a * (e * i - f * h) - b * (b * i - f * c) + c * (b * h - e * c)
     inv_det = 1.0 / (det + 1e-8) # Epsilon for stability
 
     # 3. Compute Inverse Elements (Cramer's Rule / Adjugate)
-    # Only need Upper Triangle due to symmetry in the final Quadratic Form? 
-    # Actually, we need full mult or optimized quadratic form. 
-    # Let's do explicit inverse elements.
-    
-    # inv_00 = (ei - fh) * inv_det
-    # inv_01 = (ch - bi) * inv_det
-    # inv_02 = (bf - ce) * inv_det
-    # inv_11 = (ai - cg) * inv_det -> (ai - c^2)
-    # inv_12 = (cd - af) * inv_det -> (cb - af)
-    # inv_22 = (ae - bd) * inv_det -> (ae - b^2)
-    
     inv_00 = (e * i - f * h) * inv_det
     inv_01 = (c * h - b * i) * inv_det
     inv_02 = (b * f - c * e) * inv_det
@@ -72,31 +65,27 @@ def fused_mahalanobis_distance(sigmas_nk, x_minus_mu_nk):
     inv_22 = (a * e - b * b) * inv_det
 
     # 4. Compute v^T * Sigma^-1 * v
-    # v = [x, y, z]
     vx = x_minus_mu_nk[..., 0]
     vy = x_minus_mu_nk[..., 1]
     vz = x_minus_mu_nk[..., 2]
 
     # Manual Matrix-Vector Multiplication to avoid creating a tensor for Sigma_inv
-    # Row 0 dot v
     t0 = inv_00 * vx + inv_01 * vy + inv_02 * vz
-    # Row 1 dot v
     t1 = inv_10 * vx + inv_11 * vy + inv_12 * vz
-    # Row 2 dot v
     t2 = inv_20 * vx + inv_21 * vy + inv_22 * vz
 
     # Final dot product
     result = vx * t0 + vy * t1 + vz * t2
-    
-    return result 
+
+    return result
 
 
 @torch.compile(mode="reduce-overhead")
 def fused_motion_correction_kernel(
-    coords_n_3, 
-    quats_k_4, 
-    trans_k_3, 
-    slice_ids_n, 
+    coords_n_3,
+    quats_k_4,
+    trans_k_3,
+    slice_ids_n,
     slice_centers_n_3,
     sigma_psf_n_3_3=None
 ):
@@ -104,13 +93,11 @@ def fused_motion_correction_kernel(
     Fuses Quaternion->Matrix, Coordinate Transform, and Sigma Transform.
     """
     # 1. Gather Motion Parameters for each point N
-    # We must index inside the kernel to allow fusion of the gather + math
-    # quats_n: (N, 4)
     q_w = quats_k_4[slice_ids_n, 0]
     q_x = quats_k_4[slice_ids_n, 1]
     q_y = quats_k_4[slice_ids_n, 2]
     q_z = quats_k_4[slice_ids_n, 3]
-    
+
     t_x = trans_k_3[slice_ids_n, 0]
     t_y = trans_k_3[slice_ids_n, 1]
     t_z = trans_k_3[slice_ids_n, 2]
@@ -130,33 +117,29 @@ def fused_motion_correction_kernel(
     r00 = 1.0 - 2.0 * (y2 + z2)
     r01 = 2.0 * (xy - wz)
     r02 = 2.0 * (xz + wy)
-    
+
     r10 = 2.0 * (xy + wz)
     r11 = 1.0 - 2.0 * (x2 + z2)
     r12 = 2.0 * (yz - wx)
-    
+
     r20 = 2.0 * (xz - wy)
     r21 = 2.0 * (yz + wx)
     r22 = 1.0 - 2.0 * (x2 + y2)
 
     # 4. Apply Coordinate Transform
     # coords = (R @ (coords - center)) + t + center
-    
-    # Shift to center
     c_x = coords_n_3[:, 0] - slice_centers_n_3[:, 0]
     c_y = coords_n_3[:, 1] - slice_centers_n_3[:, 1]
     c_z = coords_n_3[:, 2] - slice_centers_n_3[:, 2]
 
-    # Rotate
     rot_x = r00 * c_x + r01 * c_y + r02 * c_z
     rot_y = r10 * c_x + r11 * c_y + r12 * c_z
     rot_z = r20 * c_x + r21 * c_y + r22 * c_z
 
-    # Translate and Shift back
     final_x = rot_x + t_x + slice_centers_n_3[:, 0]
     final_y = rot_y + t_y + slice_centers_n_3[:, 1]
     final_z = rot_z + t_z + slice_centers_n_3[:, 2]
-    
+
     coords_mc = torch.stack([final_x, final_y, final_z], dim=-1)
 
     # 5. Apply Sigma PSF Transform (if needed)
@@ -168,30 +151,27 @@ def fused_motion_correction_kernel(
         s20 = sigma_psf_n_3_3[:, 2, 0]; s21 = sigma_psf_n_3_3[:, 2, 1]; s22 = sigma_psf_n_3_3[:, 2, 2]
 
         # First Matmul: Temp = R @ Sigma
-        # We manually unroll to keep it in registers
         t00 = r00*s00 + r01*s10 + r02*s20
         t01 = r00*s01 + r01*s11 + r02*s21
         t02 = r00*s02 + r01*s12 + r02*s22
-        
+
         t10 = r10*s00 + r11*s10 + r12*s20
         t11 = r10*s01 + r11*s11 + r12*s21
         t12 = r10*s02 + r11*s12 + r12*s22
-        
+
         t20 = r20*s00 + r21*s10 + r22*s20
         t21 = r20*s01 + r21*s11 + r22*s21
         t22 = r20*s02 + r21*s12 + r22*s22
 
         # Second Matmul: Result = Temp @ R.T
-        # Note: R.T means we dot with rows of R again
-        # Res00 = row0(Temp) . row0(R)
         res00 = t00*r00 + t01*r01 + t02*r02
         res01 = t00*r10 + t01*r11 + t02*r12
         res02 = t00*r20 + t01*r21 + t02*r22
-        
+
         res10 = t10*r00 + t11*r01 + t12*r02
         res11 = t10*r10 + t11*r11 + t12*r12
         res12 = t10*r20 + t11*r21 + t12*r22
-        
+
         res20 = t20*r00 + t21*r01 + t22*r02
         res21 = t20*r10 + t21*r11 + t22*r12
         res22 = t20*r20 + t21*r21 + t22*r22
@@ -204,8 +184,16 @@ def fused_motion_correction_kernel(
 
     return coords_mc, sigma_tf
 
-# Gaussian Primitives SVR
+
 class GSVR(nn.Module):
+    """3D Gaussian Splatting model for Slice-to-Volume Reconstruction.
+
+    Represents a 3D volume as a mixture of anisotropic Gaussians with learnable
+    means, covariance (via scaling + rotation quaternions), and per-Gaussian
+    intensity. Supports inter-slice motion correction via per-slice quaternion
+    rotations and translations.
+    """
+
     def __init__(self, num_gaussians, num_slices, D, bbox_wrld, mc=False, apply_slice_scaling=False, apply_slice_uncertainty=False):
         super().__init__()
         # Ensure D=3 for this 3D model
@@ -214,21 +202,20 @@ class GSVR(nn.Module):
         self.mc = mc
         if D != 3:
             print(f"Warning: Initializing 3D Gaussian Primitives SVR model but D was set to {D}. Forcing D=3.")
-            
+
         self.num_gaussians = num_gaussians # K
-        self.sigmoid = nn.Sigmoid() 
         # --- 3D Parameters ---
-        
+
         # 1. Mean (mu)
         # Initialize mean randomly across the space, -1 to 1
-        self.mu = nn.Parameter((torch.rand(num_gaussians, self.D) * 2 - 1) * (bbox_wrld.cpu()//2-1)) 
+        self.mu = nn.Parameter((torch.rand(num_gaussians, self.D) * 2 - 1) * (bbox_wrld.cpu()//2-1))
         # 2. Scaling (s)
         self.scaling = nn.Parameter((torch.ones(num_gaussians, self.D) + torch.randn(num_gaussians, self.D)*0.1) * 0.1)
         # 3. Rotation (q) - Quaternions
         # (K, 4) tensor. (w, x, y, z)
         # Initialize to identity rotation (w=1, x=0, y=0, z=0)
         self.rotation_g = nn.Parameter(torch.zeros(num_gaussians, 4))
-        self.rotation_g.data[:, 0] = 1.0 
+        self.rotation_g.data[:, 0] = 1.0
         # 4. Color (c)
         self.color = nn.Parameter(torch.ones(num_gaussians) * 0.5)
 
@@ -247,10 +234,12 @@ class GSVR(nn.Module):
         """
         Content-adaptive initialization for mu and color, based on
         Section 3.3 and Equation (6) of the Image-GS paper. [cite: 230, 231, 234]
-        
+
         Args:
-            target_image_np (np.ndarray): The target image volume.
+            stack_imgs: List of image volumes (np.ndarray).
+            stack_affines: List of affine matrices (np.ndarray).
             lambda_init (float): Weight for uniform sampling. [cite: 238]
+            device: Target torch device.
         """
         print("Running content-adaptive parameter initialization...")
         grad_mags = []
@@ -258,7 +247,6 @@ class GSVR(nn.Module):
         values_nz = []
         for stack_img, stack_affine in zip(stack_imgs, stack_affines):
             # 1. Calculate Gradient Magnitude
-            # np.gradient returns a list of arrays [grad_d0, grad_d1, ...]
             values = stack_img.ravel()
             grads = np.gradient(stack_img)
             grad_mag = np.sqrt(sum(g**2 for g in grads)) # ||∇I(x)||_2
@@ -282,7 +270,7 @@ class GSVR(nn.Module):
         grad_mags = np.concatenate(grad_mags, axis=0)
         grad_mag_coord_wrlds = np.concatenate(grad_mag_coord_wrlds, axis=0)
         values_nz = np.concatenate(values_nz, axis=0)
-        # 2. Calculate Sampling Probabilities (Eq. 6) 
+        # 2. Calculate Sampling Probabilities (Eq. 6)
         grad_sum = np.sum(grad_mags)
         if grad_sum > 0:
             grad_prob = grad_mags / grad_sum
@@ -291,10 +279,10 @@ class GSVR(nn.Module):
 
         uniform_prob = 1.0 / grad_mags.size
         P_init = (1.0 - lambda_init) * grad_prob + lambda_init * uniform_prob
-        P_init /= np.sum(P_init) # Ensure it sums to 1    
+        P_init /= np.sum(P_init) # Ensure it sums to 1
         # Sample 'num_gaussians' indices based on the probability distribution
-        sampled_indices = torch.multinomial(torch.from_numpy(P_init), 
-                                            num_samples=self.num_gaussians, 
+        sampled_indices = torch.multinomial(torch.from_numpy(P_init),
+                                            num_samples=self.num_gaussians,
                                             replacement=False)
         sampled_coords_wrld = torch.from_numpy(grad_mag_coord_wrlds[sampled_indices]).to(dtype=torch.float32, device=device)
         sampled_colors = torch.from_numpy(values_nz[sampled_indices]).to(dtype=torch.float32, device=device)
@@ -302,11 +290,8 @@ class GSVR(nn.Module):
         # 5. Initialize Parameters
         with torch.no_grad():
             self.mu.data = sampled_coords_wrld.to(device)
-        
-        # colors_nrmd_sigmoid_inv = -torch.log(1.0 / (sampled_colors+1e-6) - 1.0)
-        # colors_softplus_inv = torch.log(torch.exp(sampled_colors) - 1.0)
+
         with torch.no_grad():
-            # self.color.data = colors_nrmd_sigmoid_inv.to(device)
             self.color.data = sampled_colors.to(device)
 
     def forward(self, coords, slice_ids=None, slice_centers=None, Sigma_psf=None, top_k_idcs=None, scale_scale=1.0, scale_threshold=1.0):
@@ -318,14 +303,13 @@ class GSVR(nn.Module):
         # K = num_gaussians
         # N = number of coordinates
         # D = 3
-        
+
         q = None
         t = None
         # --- Compute Gaussian ---
         # 1. Compute v = (x - mu)
         # (N, 1, D) - (1, K, D) -> (N, K, D)
         mus = self.mu[top_k_idcs] if top_k_idcs is not None else self.mu
-        # mus = self.mu
         x_minus_mu = (coords.unsqueeze(1) - mus)
 
         # 2. Compute Inverse Covariance
@@ -339,75 +323,42 @@ class GSVR(nn.Module):
             sigmas = sigmas.to(dtype=torch.float32)
 
         # 3. Compute the inner term: v^T @ M @ v
-        # use torch.linalg.solve instead of torch.linalg.inv for better numerical stability and speed
-        # M_v = Sigma_inv @ (x_minus_mu) <=> Sigma @ M_v = x_minus_mu --> torch.linalg.solve(Sigma, x_minus_mu) = M_v
-        # sigmas_flat = sigmas.view(-1, 3, 3).to(dtype=torch.float32)
-        # v_flat = x_minus_mu.view(-1, 3).to(dtype=torch.float32)
-
-        # linalg solve
-        # M_v_flat = torch.linalg.solve(sigmas_flat, v_flat)
-        # M_v = M_v_flat.view(sigmas.shape[0], sigmas.shape[1], 3)
-        # inner_term = torch.sum(x_minus_mu * M_v, dim=2) 
-        
-
-        # try cholesky decomposition instead of inverse
-        # L = torch.linalg.cholesky(sigmas_flat)
-        # y = torch.linalg.solve_triangular(L, v_flat.unsqueeze(-1), upper=False).squeeze(-1)
-        # inner_term = torch.sum(y**2, dim=1).view(sigmas.shape[0], sigmas.shape[1])
-
         inner_term = fused_mahalanobis_distance(sigmas, x_minus_mu)
-        
+
         # 4. Compute weights
         spatial_weights = torch.exp(-0.5 * inner_term) # (N, K)
-        # 3. Learned Opacity
-        # alpha_logits = torch.sigmoid(self.logit_opacity[top_k_idcs]) 
-        
-        # 4. Color / Luminance
-        # We clamp to 0.0 to ensure no negative colors, but NO min_luminance floor needed now.
-        color_vals = self.color[top_k_idcs]
-        # color_vals = color_vals.clamp(min=0.3, max=1.0)
-        
-        # --- THE IMPLEMENTATION OF YOUR IDEA ---
-        # "Luminance Gating": The effective opacity is scaled by the brightness.
-        # If Color -> 0 (Background), then Weight -> 0 (Transparent).
-        # This acts as a continuous, differentiable mask.
-        raw_weights = spatial_weights# * alpha_logits * color_vals
 
-        # 5. Soft Normalization (Still essential for noise reduction!)
-        # We still need delta to handle the "empty space" math
-        delta = 5e-2#6
+        # 5. Color / Luminance
+        color_vals = self.color[top_k_idcs]
+
+        raw_weights = spatial_weights
+
+        # 6. Soft Normalization (Still essential for noise reduction!)
+        delta = 5e-2
         sum_weights = torch.sum(raw_weights, dim=1, keepdim=True)
         gaussian_weights_nrmd = raw_weights / (sum_weights + delta)
-        # 6. Final Composition
-        # Note: Since weights are already scaled by color, we just sum them?
-        # NO. We need to be careful. Standard splatting is Sum(w_i * c_i).
-        # Since we put color into w_i, we have effectively squared the color influence for the weighing
-        # but we must still multiply by color for the final value.
-        
+        # 7. Final Composition
         intensity = torch.sum(gaussian_weights_nrmd * color_vals, dim=1)
         if scale_scale != 1.0:
             intensity = intensity * (sum_weights.squeeze(-1) >scale_threshold).float()
 
-        # 7. Background Composite
-        # Calculate how much "signal" is here.
-        # alpha_acc = sum_weights / (sum_weights + delta)
-        # bg_color = 0.0
-        
-        # final_color = rgb_splat + (1.0 - alpha_acc.squeeze(-1)) * bg_color
         return intensity, q, t,
 
     def motion_correction_fused(self, coords, slice_ids, slice_centers, Sigma_psf=None):
-        '''
-        Applies motion correction to the coordinates.
-        coords: (N, D) tensor of coordinates, where D=3
-        slice_idcs: (N,) tensor of slice indices
-        slice_centers: (N, D) tensor of slice centers, where D=3
-        '''
-        # coords_min = coords.min(dim=0).values
-        # coords_max = coords.max(dim=0).values
-        # coords_range = coords_max - coords_min
-        # coords_nrmd = 2 * ((coords - coords_min) / coords_range) - 1
-        # slice_centers_nrmd = 2 * (slice_centers / coords_range)
+        """Applies fused motion correction to coordinates and PSF covariances.
+
+        Transforms coordinates by per-slice rotation (quaternion) and translation,
+        and optionally rotates the PSF covariance matrices accordingly.
+
+        Args:
+            coords: (N, 3) tensor of world coordinates.
+            slice_ids: (N,) tensor of per-voxel slice indices.
+            slice_centers: (N, 3) tensor of slice center coordinates.
+            Sigma_psf: Optional (N, 3, 3) PSF covariance matrices.
+
+        Returns:
+            Tuple of (corrected_coords, transformed_psf, rotation_xyz, translation).
+        """
         quats = self.rotation_mc
         trans = self.translation_mc
 
@@ -417,40 +368,10 @@ class GSVR(nn.Module):
         )
 
         # For the regularization loss, we still need to fetch the specific q/t
-        # But this is cheap compared to the transform
         batch_q = quats[slice_ids]
         batch_t = trans[slice_ids]
         rot = batch_q[:, 1:] # x,y,z parts for visualization if needed
         return coords_mc, Sigma_psf_tf, rot, batch_t
-
-    def motion_correction(self, coords, slice_ids, slice_centers, Sigma_psf=None):
-        '''
-        Applies motion correction to the coordinates.
-        coords: (N, D) tensor of coordinates, where D=3
-        slice_idcs: (N,) tensor of slice indices
-        slice_centers: (N, D) tensor of slice centers, where D=3
-        '''
-        # coords_min = coords.min(dim=0).values
-        # coords_max = coords.max(dim=0).values
-        # coords_range = coords_max - coords_min
-        # coords_nrmd = 2 * ((coords - coords_min) / coords_range) - 1
-        # slice_centers_nrmd = 2 * (slice_centers / coords_range)
-        quats = self.rotation_mc[slice_ids]
-        # 1. Compute the rotation matrix
-        R = self.build_rotation_matrix_from_quaternion(quats) # (K, 3, 3)
-        # 2. Compute the translation
-        t = self.translation_mc[slice_ids] # (N, 3)
-        # 3. Apply the motion correction
-        # 3.1 shift the coordinates to the slice center
-        coords = coords - slice_centers
-        # 3.2 apply the rotation
-        coords_mc = torch.einsum('nij,nj->ni', R, coords) + t
-        # 3.3 shift the coordinates back to the original position
-        coords_mc = coords_mc + slice_centers
-        Sigma_psf_tf = torch.einsum('nij,njk->nik', R, Sigma_psf)
-        Sigma_psf_tf = torch.einsum('nik,njk->nij', Sigma_psf_tf, R)
-        rot = quats[:, 1:]
-        return coords_mc, Sigma_psf_tf, rot, t
 
     def build_rotation_matrix_from_quaternion(self, q):
         '''
@@ -459,9 +380,9 @@ class GSVR(nn.Module):
         '''
         # Normalize quaternions to ensure they are unit quaternions
         q_norm = torch.nn.functional.normalize(q, p=2, dim=1)
-        
+
         w, x, y, z = q_norm[:, 0], q_norm[:, 1], q_norm[:, 2], q_norm[:, 3]
-        
+
         K = q.shape[0]
         R = torch.empty((K, 3, 3), device=q.device, dtype=q.dtype)
 
@@ -482,7 +403,7 @@ class GSVR(nn.Module):
         R[:, 2, 0] = 2.0 * (xz - wy)
         R[:, 2, 1] = 2.0 * (yz + wx)
         R[:, 2, 2] = 1.0 - 2.0 * (x2 + y2)
-        
+
         return R
 
     def compute_sigma(self, scale_scale=1.0):
@@ -493,25 +414,17 @@ class GSVR(nn.Module):
         # 1. Get R from quaternions
         R = self.build_rotation_matrix_from_quaternion(self.rotation_g) # (K, 3, 3)
 
-        # if inv:
-        #     scaling_inv = 1 / self.scaling # (K, 3)
-        #     S_inv = torch.diag_embed(scaling_inv**2) # (K, 3, 3)
-        #     Sigma_inv = torch.bmm(R, torch.bmm(S_inv, R.transpose(1, 2))) # (K, 3, 3)
-        #     return Sigma_inv
-        # else: # use PSF, meaning Sigma_new = Sigma + Sigma_psf, Sigma_new_inv = torch.linalg.inv(Sigma_new)
-        # scaling = self.scaling
-        # S = torch.diag_embed(scaling**2) # (K, 3, 3)
         scaling = torch.exp(self.scaling)
         S = torch.diag_embed(scaling * scale_scale) # (K, 3, 3)
-        Sigma = torch.bmm(R, torch.bmm(S, R.transpose(1, 2))) # (K, 3, 3)  
+        Sigma = torch.bmm(R, torch.bmm(S, R.transpose(1, 2))) # (K, 3, 3)
         return Sigma
 
 def create_vis_grid(grid_shape, bbox_wrld, device):
     '''Creates a 3D coordinate grid.
-    
+
     Args:
         grid_shape: (3,) tuple of the grid shape
-        spacing: (3,) tuple of the voxel spacing
+        bbox_wrld: (3,) bounding box extents in world coordinates
         device: torch.device
     Returns:
         coords_flat: (N, 3) tensor of coordinates
@@ -523,13 +436,31 @@ def create_vis_grid(grid_shape, bbox_wrld, device):
     return coords_flat
 
 
-def visualize_gaussians(groundtruth, gs, gpu_index, vis_grid_flat, shape_rec, spacing_rec, new_origin, epoch=0, k=10, BATCH_SIZE=1_000_000, psf_scale_fac=1.0, output_file_path=None, PSF=False, ttime=0, min_value=0.0, max_value=1.0, scale_scale=0.0, scale_threshold=1.0):
-    '''
-    Visualizes a 2D slice of the 3D Gaussian field using k-NN.
-    gs: The Gaussian Primitives model
-    vis_grid_flat: (N_vis, 3) tensor of coordinates for the slice
-    vis_slice_shape: (H, W) tuple for reshaping the final image
-    '''
+def visualize_gaussians(gs, gpu_index, vis_grid_flat, shape_rec, spacing_rec, new_origin, epoch=0, k=10, BATCH_SIZE=1_000_000, psf_scale_fac=1.0, output_file_path=None, PSF=False, ttime=0, min_value=0.0, max_value=1.0, scale_scale=0.0, scale_threshold=1.0):
+    """Reconstruct and save the 3D volume from the current Gaussian model.
+
+    Evaluates the model on a dense 3D grid using k-NN culling and saves
+    the result as a NIfTI file.
+
+    Args:
+        gs: The GSVR model.
+        gpu_index: FAISS GPU index for k-NN lookup.
+        vis_grid_flat: (N_vis, 3) dense evaluation coordinates.
+        shape_rec: (3,) reconstruction grid dimensions.
+        spacing_rec: (3,) voxel spacing for the output.
+        new_origin: (3,) world-space origin of the output volume.
+        epoch: Current training epoch (for filename).
+        k: Number of nearest Gaussian neighbors per query point.
+        BATCH_SIZE: Number of points per forward pass.
+        psf_scale_fac: PSF scale factor.
+        output_file_path: Path template for the output NIfTI file.
+        PSF: Whether to apply PSF convolution.
+        ttime: Total training time (for filename).
+        min_value: Min intensity before normalization (for de-normalization).
+        max_value: Max intensity before normalization (for de-normalization).
+        scale_scale: Scale factor for Gaussian scales during visualization.
+        scale_threshold: Weight threshold for masking low-confidence voxels.
+    """
     device = vis_grid_flat.device
     # 2. Evaluate the model
     values_pred_flat = torch.empty((vis_grid_flat.shape[0],), device=device)
@@ -548,16 +479,6 @@ def visualize_gaussians(groundtruth, gs, gpu_index, vis_grid_flat, shape_rec, sp
     # unnormalize the values
     values_pred = values_pred * (max_value - min_value) + min_value
 
-    groundtruth_data = groundtruth.get_fdata() if groundtruth is not None else None
-
-    # values_pred = (values_pred - values_pred.min()) / (values_pred.max() - values_pred.min())
-    # groundtruth_data = ((groundtruth_data - groundtruth_data.min()) / (groundtruth_data.max() - groundtruth_data.min())).astype(np.float32)
-
-
-    # psnr = skimage.metrics.peak_signal_noise_ratio(groundtruth, values_pred)
-    # ssim = skimage.metrics.structural_similarity(groundtruth, values_pred, data_range=1.0)
-    psnr=0
-    ssim=0
     rec_affine = np.diag(list(spacing_rec) + [1.0])
     rec_affine[:3, 3] = new_origin
     # save the reconstructed image as a 3D volume via nibabel
@@ -565,11 +486,7 @@ def visualize_gaussians(groundtruth, gs, gpu_index, vis_grid_flat, shape_rec, sp
     filename = output_file_path.replace('.nii.gz', f'_ttime={ttime:.2f}s.nii.gz')
     nib.save(rec_nii, filename)
 
-    if epoch == 0 and groundtruth is not None:
-        # gt_aff = groundtruth.affine
-        groundtruth_3D = nib.Nifti1Image(groundtruth_data, groundtruth.affine)
-        nib.save(groundtruth_3D, output_file_path.replace('.nii.gz', f'_groundtruth_3D_epoch_{epoch}.nii.gz'))
-    print(f"Epoch {epoch} PSNR: {psnr}, SSIM: {ssim}")
+    print(f"Epoch {epoch}")
 
     # empty the cache
     torch.cuda.empty_cache()
@@ -589,20 +506,29 @@ def _init_optim(gs, MC, SLICE_SCALING, SLICE_UNCERTAINTY, max_epochs, lrs):
     if MC:
         param_groups.append({'params': gs.rotation_mc, 'lr': lrs['motion_rot']})
         param_groups.append({'params': gs.translation_mc, 'lr': lrs['motion_trans']})
-    if SLICE_SCALING:   
+    if SLICE_SCALING:
         param_groups.append({'params': gs.slice_scaling, 'lr': lrs['slice_scale'], 'name': 'gs_slice_scaling'})
     if SLICE_UNCERTAINTY:
         param_groups.append({'params': gs.slice_weight, 'lr': lrs['slice_weight'], 'name': 'gs_slice_weights'})
 
-    # --- 3. Optimizer Setup ---
     optimizer = torch.optim.AdamW(param_groups)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1.0e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.5)
     grad_scaler = torch.amp.GradScaler()
     return optimizer, scheduler, grad_scaler
 
 
 def train(stack_paths=None, mask_paths=None, config=None, output_file_path=None):
+    """Run the full GSVR training pipeline.
+
+    Loads data, builds the Gaussian model, runs optimization, and saves
+    the reconstructed 3D volume.
+
+    Args:
+        stack_paths: List of paths to input NIfTI stacks.
+        mask_paths: List of paths to corresponding mask NIfTI files.
+        config: Configuration dictionary.
+        output_file_path: Path for saving the output reconstruction.
+    """
     # seed everything
     torch.manual_seed(42)
     np.random.seed(42)
@@ -626,124 +552,135 @@ def train(stack_paths=None, mask_paths=None, config=None, output_file_path=None)
     DENOISE = config['preprocessing']['denoise']
     spacing_rec = config['reconstruction']['spacing']
     slice_thickness = config['reconstruction']['slice_thickness']
+    use_masks = config['flags'].get('use_masks', True)
 
     # --- ADD: Smoothness Regularization ---
-    # We penalize scales for being far from our target "smooth" value
     l2_lambda = config['training']['loss_weights']['lambda_l2_scale']
     log_scale_target = config['training']['loss_weights']['log_scale_target']
 
+    profiler = PipelineProfiler(device)
+
     # --- 1. Data Setup ---
-    (gt_nii, imgs, affines, slice_ids, slice_centers_wrld_np, 
-    coords_wrld_np, values_np, Sigma_psf, bbox_wrld, new_origin, min_value, max_value) = load_data(stack_paths=stack_paths, mask_paths=mask_paths, slice_thickness=slice_thickness,
-                                                                             psf_scale_fac=PSF_SCALE_FAC, dilate_mask_sigma=config['preprocessing']['dilate_mask_sigma'], 
-                                                                             bias_field_correction=BIAS_FIELD_CORRECTION, denoise=DENOISE)
+    with profiler.stage("Load data"):
+        (imgs, affines, slice_ids, slice_centers_wrld_np,
+        coords_wrld_np, values_np, Sigma_psf, bbox_wrld, new_origin, min_value, max_value) = load_data(stack_paths=stack_paths, mask_paths=mask_paths, slice_thickness=slice_thickness,
+                                                                                 psf_scale_fac=PSF_SCALE_FAC, dilate_mask_sigma=config['preprocessing']['dilate_mask_sigma'],
+                                                                                 bias_field_correction=BIAS_FIELD_CORRECTION, denoise=DENOISE, use_masks=use_masks)
     shape_rec = [math.ceil(b/s) for b, s in zip(bbox_wrld, spacing_rec)]
     bbox_wrld = np.array([d*s for d, s in zip(shape_rec, spacing_rec)])
-    
+
     # --- Pre-compute Visualization Grid ---
     vis_grid_flat_3D = create_vis_grid(shape_rec, bbox_wrld, device)
     print(f"Number of non-zero voxels in the raw data: {len(values_np)}")
-    # --- 2. GSVR Model Setup ---
-    gs = GSVR(num_gaussians, np.max(slice_ids)+1, D=D, bbox_wrld=torch.from_numpy(bbox_wrld).to(dtype=torch.float32, device=device), mc=MC, apply_slice_scaling=SLICE_SCALING, apply_slice_uncertainty=SLICE_UNCERTAINTY)
-    if INIT:
-        gs.initialize_parameters_from_image(imgs, affines, lambda_init=0.0, device=device)
-    gs.to(device)
-    print(f"Training on device: {device}")
-    gs = torch.compile(gs, mode="reduce-overhead") # Can add this back for speed
 
-    optimizer, scheduler, grad_scaler = _init_optim(gs, MC, SLICE_SCALING, SLICE_UNCERTAINTY, max_epochs, lrs)
+    # --- 2. GSVR Model Setup ---
+    with profiler.stage("Build model"):
+        gs = GSVR(num_gaussians, np.max(slice_ids)+1, D=D, bbox_wrld=torch.from_numpy(bbox_wrld).to(dtype=torch.float32, device=device), mc=MC, apply_slice_scaling=SLICE_SCALING, apply_slice_uncertainty=SLICE_UNCERTAINTY)
+        if INIT:
+            gs.initialize_parameters_from_image(imgs, affines, lambda_init=0.0, device=device)
+        gs.to(device)
+        print(f"Training on device: {device}")
+        gs = torch.compile(gs, mode="reduce-overhead") # Can add this back for speed
+
+    with profiler.stage("Init optimizer"):
+        optimizer, scheduler, grad_scaler = _init_optim(gs, MC, SLICE_SCALING, SLICE_UNCERTAINTY, max_epochs, lrs)
     loss_fn = nn.L1Loss()
-    # scheduler = None
-    
+
     # --- 4. FAISS Setup ---
-    ressource = faiss.StandardGpuResources() # Use GPU resources
-    faiss_config = faiss.GpuIndexFlatConfig()
-    faiss_config.device = 0
-    # Create the GPU index directly (No CPU wrapper)
-    gpu_index = faiss.GpuIndexFlatL2(ressource, D, faiss_config)
+    with profiler.stage("FAISS setup"):
+        ressource = faiss.StandardGpuResources() # Use GPU resources
+        faiss_config = faiss.GpuIndexFlatConfig()
+        faiss_config.device = 0
+        # Create the GPU index directly (No CPU wrapper)
+        gpu_index = faiss.GpuIndexFlatL2(ressource, D, faiss_config)
+
     # --- 5. Convert data to tensors and move to device ---
-    coords_wrld = torch.from_numpy(coords_wrld_np).float().to(device)
-    slice_centers_wrld = torch.from_numpy(slice_centers_wrld_np).float().to(device) if MC else None
-    values = torch.from_numpy(values_np).float().to(device)
-    Sigma_psf = torch.from_numpy(Sigma_psf).float().to(device) if PSF else None
-    
-    slice_ids = torch.from_numpy(slice_ids).int().to(device).contiguous()
+    with profiler.stage("Data to GPU"):
+        coords_wrld = torch.from_numpy(coords_wrld_np).float().to(device)
+        slice_centers_wrld = torch.from_numpy(slice_centers_wrld_np).float().to(device) if MC else None
+        values = torch.from_numpy(values_np).float().to(device)
+        Sigma_psf = torch.from_numpy(Sigma_psf).float().to(device) if PSF else None
+
+        slice_ids = torch.from_numpy(slice_ids).int().to(device).contiguous()
 
     # --- 6. Training Loop ---
-    t0 = time.time()
-    total_time = 0
-    for i in range(max_epochs):
-        # batches
-        batch_coords_wrld = coords_wrld.contiguous()#[0:len_data+BATCH_SIZE]
-        batch_slice_centers_wrld = slice_centers_wrld#[0:len_data+BATCH_SIZE] if MC else None
-        batch_values = values#[0:len_data+BATCH_SIZE]
-        batch_Sigma_psf = Sigma_psf#[0:len_data+BATCH_SIZE] if PSF else None
-        batch_slice_ids = slice_ids#[0:len_data+BATCH_SIZE] if MC else None
+    with profiler.stage("Training loop"):
+        t0 = time.time()
+        total_time = 0
+        for i in range(max_epochs):
+            # batches
+            batch_coords_wrld = coords_wrld.contiguous()
+            batch_slice_centers_wrld = slice_centers_wrld
+            batch_values = values
+            batch_Sigma_psf = Sigma_psf
+            batch_slice_ids = slice_ids
 
-        loss_history = {'sr': [], 'sr_reg': [], 'mc': []}
-        optimizer.zero_grad()
-        with torch.amp.autocast(device_type=device.type):
-            if MC and batch_slice_centers_wrld is not None and batch_slice_ids is not None:
-                batch_coords_wrld, batch_Sigma_psf_tf, batch_q, batch_t = gs.motion_correction_fused(batch_coords_wrld, batch_slice_ids, batch_slice_centers_wrld, Sigma_psf=batch_Sigma_psf)
-                batch_Sigma_psf = batch_Sigma_psf_tf if batch_Sigma_psf_tf is not None else batch_Sigma_psf
-            else:
-                batch_q = torch.tensor([0.0])
-                batch_t = torch.tensor([0.0])
-            if i % TOP_K_EVERY == 0:
-                gpu_index.reset()
-                gpu_index.add(gs.mu.data)
-                _, top_k_idcs = gpu_index.search(batch_coords_wrld, M_NEIGHBORS) # Search for nearest neighbors in the faiss index
-                batch_top_k_idcs = top_k_idcs #torch.from_numpy(top_k_idcs).to(device)
-                if (top_k_idcs >= gs.num_gaussians).any() or (top_k_idcs < 0).any():
-                    print("Error: Faiss returned invalid indices!")
-                    top_k_idcs = torch.clamp(top_k_idcs, min=0, max=gs.num_gaussians-1)
+            loss_history = {'sr': [], 'sr_reg': [], 'mc': []}
+            optimizer.zero_grad()
+            with torch.amp.autocast(device_type=device.type):
+                if MC and batch_slice_centers_wrld is not None and batch_slice_ids is not None:
+                    batch_coords_wrld, batch_Sigma_psf_tf, batch_q, batch_t = gs.motion_correction_fused(batch_coords_wrld, batch_slice_ids, batch_slice_centers_wrld, Sigma_psf=batch_Sigma_psf)
+                    batch_Sigma_psf = batch_Sigma_psf_tf if batch_Sigma_psf_tf is not None else batch_Sigma_psf
+                else:
+                    batch_q = torch.tensor([0.0])
+                    batch_t = torch.tensor([0.0])
+                if i % TOP_K_EVERY == 0:
+                    gpu_index.reset()
+                    gpu_index.add(gs.mu.data)
+                    _, top_k_idcs = gpu_index.search(batch_coords_wrld, M_NEIGHBORS)
+                    batch_top_k_idcs = top_k_idcs
+                    if (top_k_idcs >= gs.num_gaussians).any() or (top_k_idcs < 0).any():
+                        print("Error: Faiss returned invalid indices!")
+                        top_k_idcs = torch.clamp(top_k_idcs, min=0, max=gs.num_gaussians-1)
 
-            color_pred, _, _ = gs(batch_coords_wrld, slice_ids=batch_slice_ids, slice_centers=batch_slice_centers_wrld, Sigma_psf=batch_Sigma_psf, top_k_idcs=batch_top_k_idcs)
-            if SLICE_SCALING:
-                slice_scales = gs.slice_scaling
-                slice_scales_softplus = torch.nn.functional.softplus(slice_scales)
-                slice_scales_softplus = slice_scales_softplus / slice_scales_softplus.mean()
-                color_pred = color_pred * slice_scales_softplus[batch_slice_ids]
-            if SLICE_UNCERTAINTY:
-                slice_weights = gs.slice_weight[batch_slice_ids]
-                sw_reg = 1e-1 * -(torch.log(slice_weights + 1e-8)).mean()
-                l1_diff = torch.abs(color_pred - batch_values)
-                loss_sr = (l1_diff * slice_weights).mean() + sw_reg
-                l1_diff = l1_diff.mean()
-            else:           
-                loss_sr = loss_fn(color_pred, batch_values)
-                l1_diff = loss_sr
-            loss_mc = (batch_q**2).mean() + (batch_t**2).mean()
-            loss_sr_reg = l2_lambda * ((gs.scaling - log_scale_target)**2).mean()
-            loss = loss_sr + loss_sr_reg
-            
-        loss_history['sr'].append(l1_diff.item())
-        loss_history['sr_reg'].append(loss_sr_reg.item())
-        loss_history['mc'].append(loss_mc.item())
-        grad_scaler.scale(loss).backward()
-        grad_scaler.step(optimizer)
-        grad_scaler.update()
-        gs.color.data.clamp_(min=0.0, max=None)
-        
-        loss_mean = {'sr': np.array(loss_history['sr']).mean(), 'sr_reg': np.array(loss_history['sr_reg']).mean(), 'mc': np.array(loss_history['mc']).mean()}    
-        if scheduler is not None:
-            scheduler.step() # Step scheduler once per epoch
-        if i == 0:
-            t0 = time.time() # don't count the very first epoch in the total training time due to torch compilation time 
-        if i % 50 == 0 or (i == max_epochs-1):
-            t1 = time.time()
-            t_delta = t1-t0
-            total_time += t_delta
-            print(f'Epoch {i} loss sr: {loss_mean["sr"]:.6f}, loss sr_reg: {loss_mean["sr_reg"]:.6f}, loss mc: {loss_mean["mc"]:.6f}, time per epoch: {t_delta/50:.2f}s, total training time: {total_time:.2f}s')
-            t0 = time.time()
-        if (i==max_epochs-1): # or (i % 500 == 0) and (i > 0):
-            print(f"Visualizing epoch {i}...")
-            visualize_gaussians(gt_nii, gs, gpu_index, vis_grid_flat_3D, shape_rec, spacing_rec, new_origin, epoch=i, k=M_NEIGHBORS, psf_scale_fac=1.0, min_value=min_value, max_value=max_value, output_file_path=output_file_path, PSF=PSF, ttime=total_time, scale_scale=1.0, scale_threshold=0.01)
-            t0 = time.time() # don't count visualization time in the total training time
+                color_pred, _, _ = gs(batch_coords_wrld, slice_ids=batch_slice_ids, slice_centers=batch_slice_centers_wrld, Sigma_psf=batch_Sigma_psf, top_k_idcs=batch_top_k_idcs)
+                if SLICE_SCALING:
+                    slice_scales = gs.slice_scaling
+                    slice_scales_softplus = torch.nn.functional.softplus(slice_scales)
+                    slice_scales_softplus = slice_scales_softplus / slice_scales_softplus.mean()
+                    color_pred = color_pred * slice_scales_softplus[batch_slice_ids]
+                if SLICE_UNCERTAINTY:
+                    slice_weights = gs.slice_weight[batch_slice_ids]
+                    sw_reg = 1e-1 * -(torch.log(slice_weights + 1e-8)).mean()
+                    l1_diff = torch.abs(color_pred - batch_values)
+                    loss_sr = (l1_diff * slice_weights).mean() + sw_reg
+                    l1_diff = l1_diff.mean()
+                else:
+                    loss_sr = loss_fn(color_pred, batch_values)
+                    l1_diff = loss_sr
+                loss_mc = (batch_q**2).mean() + (batch_t**2).mean()
+                loss_sr_reg = l2_lambda * ((gs.scaling - log_scale_target)**2).mean()
+                loss = loss_sr + loss_sr_reg
+
+            loss_history['sr'].append(l1_diff.item())
+            loss_history['sr_reg'].append(loss_sr_reg.item())
+            loss_history['mc'].append(loss_mc.item())
+            grad_scaler.scale(loss).backward()
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            gs.color.data.clamp_(min=0.0, max=None)
+
+            loss_mean = {'sr': np.array(loss_history['sr']).mean(), 'sr_reg': np.array(loss_history['sr_reg']).mean(), 'mc': np.array(loss_history['mc']).mean()}
+            if scheduler is not None:
+                scheduler.step() # Step scheduler once per epoch
+            if i == 0:
+                t0 = time.time() # don't count the very first epoch in the total training time due to torch compilation time
+            if i % 50 == 0 or (i == max_epochs-1):
+                t1 = time.time()
+                t_delta = t1-t0
+                total_time += t_delta
+                print(f'Epoch {i} loss sr: {loss_mean["sr"]:.6f}, loss sr_reg: {loss_mean["sr_reg"]:.6f}, loss mc: {loss_mean["mc"]:.6f}, time per epoch: {t_delta/50:.2f}s, total training time: {total_time:.2f}s')
+                t0 = time.time()
+            if (i==max_epochs-1):
+                print(f"Visualizing epoch {i}...")
+                visualize_gaussians(gs, gpu_index, vis_grid_flat_3D, shape_rec, spacing_rec, new_origin, epoch=i, k=M_NEIGHBORS, psf_scale_fac=1.0, min_value=min_value, max_value=max_value, output_file_path=output_file_path, PSF=PSF, ttime=total_time, scale_scale=1.0, scale_threshold=0.01)
+                t0 = time.time() # don't count visualization time in the total training time
+
+    profiler.summary()
 
 def generate_cov_psf(affine3x3, spacing, slice_thickness=None, scale_factor=1.0):
     '''
-    Generates a PSF covariance matrix for a given stack. 
+    Generates a PSF covariance matrix for a given stack.
     The psf is approximated as a 3D Gaussian with a given standard deviation.
     In-plane resolution is given by stack_spacing, slice thickness is given by slice_thickness if provided, otherwise it is assumed to be isotropic.
     '''
@@ -756,7 +693,7 @@ def generate_cov_psf(affine3x3, spacing, slice_thickness=None, scale_factor=1.0)
     L = affine3x3[:3, :3] / np.linalg.norm(affine3x3[:3, :3], axis=0)
     Sigma_psf = L @ Sigma_psf @ L.T
     return Sigma_psf
-    
+
 
 def dilate_mask(mask_np, sigma=1.0):
     '''
@@ -770,33 +707,58 @@ def dilate_mask(mask_np, sigma=1.0):
         return mask_np.astype(np.uint8)
 
 
-def load_data(stack_paths=None, mask_paths=None, slice_thickness=None, psf_scale_fac=1.0, dilate_mask_sigma=0.5, bias_field_correction=False, denoise=False):
+def load_data(stack_paths=None, mask_paths=None, slice_thickness=None, psf_scale_fac=1.0, dilate_mask_sigma=0.5, bias_field_correction=False, denoise=False, use_masks=True):
+    """Load and preprocess input stacks for GSVR training.
+
+    Reads NIfTI image stacks and optional masks, computes world coordinates,
+    PSF covariance matrices, and normalizes intensities.
+
+    Args:
+        stack_paths: List of paths to input NIfTI stacks.
+        mask_paths: List of paths to mask NIfTI files (empty list for auto-masking).
+        slice_thickness: Per-stack slice thickness values.
+        psf_scale_fac: Scale factor for the PSF model.
+        dilate_mask_sigma: Gaussian sigma for mask dilation.
+        bias_field_correction: Whether to apply N4 bias field correction.
+        denoise: Whether to apply ANTs denoising.
+        use_masks: If False and no external masks provided, use all voxels
+            (np.ones) instead of thresholding on intensity > 0.
+
+    Returns:
+        Tuple of (imgs, affines, slice_ids, slice_centers, coords, values,
+        Sigma_psf, bbox, origin, min_value, max_value).
+    """
     stacks_img = stack_paths
     stacks_mask = mask_paths
     slice_thickness = [slice_thickness[0]]*len(stack_paths) if slice_thickness else slice_thickness
-    gt_nii = None
 
     all_values = []
     all_coords_wrld = []
     all_affines = []
     all_imgs = []
     all_Sigma_psf = []
-    all_slice_centers_wrld = [] # slice center where slice refers to the thick-slice, i.e. lat axis
+    all_slice_centers_wrld = [] # slice center where slice refers to the thick-slice, i.e. last axis
     all_slice_idcs = []
     n_slices_global = 0
     percentile_99 = 0.0
     for i, stack in enumerate(stacks_img):
         # load images
         stack_img = nib.load(stack)
-        stack_mask_data = ((stack_img.get_fdata()>0.01).astype(np.int32)) if len(stacks_mask) == 0 else (nib.load(stacks_mask[i]).get_fdata()>0).astype(np.int32).squeeze()
+        if len(stacks_mask) > 0:
+            stack_mask_data = (nib.load(stacks_mask[i]).get_fdata()>0).astype(np.int32).squeeze()
+        elif use_masks:
+            stack_mask_data = (stack_img.get_fdata() > 0.00).astype(np.int32)
+        else:
+            stack_mask_data = np.ones(stack_img.shape[:3], dtype=np.int32)
         stack_img_data = (stack_img.get_fdata() * stack_mask_data).clip(0.0, None)
         stack_mask_data = dilate_mask(stack_mask_data, sigma=dilate_mask_sigma)
         stack_affine = stack_img.affine
         stack_spacing = stack_img.header.get_zooms()[:3]
-        # get 99th percentile of stack_img_data
-        percentile_99 = max(percentile_99, np.percentile(stack_img_data[stack_mask_data>0], 99.9))
+        # get 99th percentile of stack_img_data over positive voxels
+        positive_voxels = stack_img_data[stack_img_data > 0]
+        if len(positive_voxels) > 0:
+            percentile_99 = max(percentile_99, np.percentile(positive_voxels, 99.9))
         # bias field correction
-        # apply ants n4 bias field correction
         if bias_field_correction:
             print(f"Applying bias field correction to stack {i}...")
             stack_img_data = ants.n4_bias_field_correction(ants.from_nibabel(nib.Nifti1Image(stack_img_data, stack_affine)))
@@ -825,7 +787,7 @@ def load_data(stack_paths=None, mask_paths=None, slice_thickness=None, psf_scale
         # get PSF
         Sigma_psf = generate_cov_psf(stack_affine, stack_spacing, slice_thickness[i], scale_factor=psf_scale_fac)
         Sigma_psf = np.broadcast_to(Sigma_psf, (len(coords_wrld), 3, 3))
-    
+
         # add to global lists
         all_imgs.append(stack_img_data)
         all_coords_wrld.append(coords_wrld)
@@ -848,8 +810,8 @@ def load_data(stack_paths=None, mask_paths=None, slice_thickness=None, psf_scale
     bbox_wrld = (np.max(all_coords_wrld, axis=0) - np.min(all_coords_wrld, axis=0)) * 1.1
     new_origin = np.min(all_coords_wrld, axis=0) + global_center_of_mass
 
-    
-    
+
+
     print(f"Global 99.9th percentile: {percentile_99}, global max: {all_values.max()}")
     all_values = all_values.clip(0.0, percentile_99)
     all_imgs = [img.clip(0.0, percentile_99) for img in all_imgs]
@@ -858,11 +820,10 @@ def load_data(stack_paths=None, mask_paths=None, slice_thickness=None, psf_scale
     all_values = (all_values - min_value) / (max_value - min_value)
     all_imgs = [(img - min_value) / (max_value - min_value) for img in all_imgs]
 
-    return gt_nii, all_imgs, all_affines, all_slice_idcs, all_slice_centers_wrld, all_coords_wrld, all_values, all_Sigma_psf, bbox_wrld, new_origin, min_value, max_value
+    return all_imgs, all_affines, all_slice_idcs, all_slice_centers_wrld, all_coords_wrld, all_values, all_Sigma_psf, bbox_wrld, new_origin, min_value, max_value
 
 
 if __name__ == '__main__':
-    # seed everything
     torch.manual_seed(42)
     np.random.seed(42)
     random.seed(42)

@@ -1,0 +1,10 @@
+torch>=2.0
+faiss-gpu-cu12
+nibabel>=5.0
+numpy>=1.24
+scipy>=1.10
+SimpleITK>=2.3
+tqdm
+antspyx
+sympy
+mpmath

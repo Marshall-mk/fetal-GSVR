@@ -1,38 +1,28 @@
 experiment:
-  output_root: "path_to_output_dir"
+  output_root: "./outputs"
   seed: 42
 
 data:
-# --- DATASET LIST ---
-data:
   subjects:
-
-    - name: "sub-CC00908XX17_ses-5131"
+    - name: "sub4"
       enabled: True
       input_stacks: 
-        - path_to_input_stack1
-        - path_to_input_stack2
-        - path_to_input_stack3
-        - path_to_input_stack4
-        - path_to_input_stack5
-        - path_to_input_stack6
-      input_masks:
-        - path_to_input_mask1
-        - path_to_input_mask2
-        - path_to_input_mask3
-        - path_to_input_mask4
-        - path_to_input_mask5
-        - path_to_input_mask6
-
+        - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WtraBHSENSEs2901a1029.nii.gz 
+        - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WCorBHSENSEs2801a1028.nii.gz 
+        - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WsagBHSENSEs3001a1030.nii.gz 
+      input_masks:  
+        - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WtraBHSENSEs2901a1029_mask.nii.gz 
+        - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WCorBHSENSEs2801a1028_mask.nii.gz 
+        - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WsagBHSENSEs3001a1030_mask.nii.gz  
 
 reconstruction:
-  spacing: [0.5, 0.5, 0.5]
+  spacing: [1, 1, 1]
   psf_scale_factor: 1.0
-  slice_thickness: [2.2, 2.2, 2.2, 2.2, 2.2, 2.2] # Can be a list [3.0, 3.0, ...] if thicknesses differ
+  slice_thickness: [5, 5, 5]
 
-
-  num_gaussians: 50000
-  init_type: "content_adaptive" # 'content_adaptive' or 'random'
+model:
+  num_gaussians: 100000
+  init_type: "content_adaptive" 
   init_lambda: 0.0 # 0.0 = only edges, 1.0 = uniform. 0.2 avoids holes in flat tissue.
 
 flags:
@@ -40,22 +30,23 @@ flags:
   use_slice_scaling: True
   use_slice_uncertainty: True # Enables Aleatoric Loss
   use_psf: True
+  use_masks: True
 
 training:
   max_epochs: 500
   batch_size: 10000000 # All points per batch (pseudobatch), actual batching not implemented yet
   neighbors: 50
-  top_k_every: 50
+  top_k_every: 80
   
   learning_rates:
-    position: 2.5e-2
+    position: 3.75e-2 
     scaling: 2.5e-2
     rotation: 1.0e-2
     color: 1.0e-2
-    motion_rot: 2.5e-3
-    motion_trans: 1.0e-1
-    slice_scale: 1.0e-3
-    slice_weight: 1.0e-3
+    motion_rot: 2.5e-4
+    motion_trans: 1.0e-2
+    slice_scale: 1.0e-2
+    slice_weight: 1.0e-2
 
   loss_weights:
     lambda_l2_scale: 0.0025 #1 #0.0025
