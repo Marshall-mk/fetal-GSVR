@@ -15,4 +15,4 @@ runai submit            \
     --working-dir /nfs/home/kmuhammad/code/fetal-GSVR \
     --large-shm         \
     --run-as-user       \
-    --command -- python train.py --config configs/config_subjects_real.yaml
+    --command -- python train.py --config configs/config_subjects_real.yaml --flags.use_masks False --training.batch_size 5000000

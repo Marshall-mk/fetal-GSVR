@@ -11,9 +11,9 @@ data:
         - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WCorBHSENSEs2801a1028.nii.gz 
         - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WsagBHSENSEs3001a1030.nii.gz 
       input_masks:  
-        - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WtraBHSENSEs2901a1029_mask.nii.gz 
-        - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WCorBHSENSEs2801a1028_mask.nii.gz 
-        - /nfs/home/kmuhammad/data/real_cases/simpleData/sub4/2D/T2W/T2WsagBHSENSEs3001a1030_mask.nii.gz  
+        - /nfs/home/kmuhammad/code/fetal-GSVR/outputs/sub4/ax.nii.gz 
+        - /nfs/home/kmuhammad/code/fetal-GSVR/outputs/sub4/cor.nii.gz 
+        - /nfs/home/kmuhammad/code/fetal-GSVR/outputs/sub4/sag.nii.gz 
 
 reconstruction:
   spacing: [1, 1, 1]
@@ -34,7 +34,7 @@ flags:
 
 training:
   max_epochs: 500
-  batch_size: 10000000 # All points per batch (pseudobatch), actual batching not implemented yet
+  batch_size: 1000000 # Mini-batch size for voxel processing (reduce to avoid OOM on large volumes)
   neighbors: 50
   top_k_every: 80
   

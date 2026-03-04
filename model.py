@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore", message=".*Please use the new API settings to 
 torch.set_float32_matmul_precision('high')
 
 
-@torch.compile(mode="reduce-overhead")
+@torch.compile
 def fused_mahalanobis_distance(sigmas_nk, x_minus_mu_nk):
     """
     Computes v^T * Sigma^-1 * v for batch N, K.
@@ -80,7 +80,7 @@ def fused_mahalanobis_distance(sigmas_nk, x_minus_mu_nk):
     return result
 
 
-@torch.compile(mode="reduce-overhead")
+@torch.compile
 def fused_motion_correction_kernel(
     coords_n_3,
     quats_k_4,
@@ -558,6 +558,8 @@ def train(stack_paths=None, mask_paths=None, config=None, output_file_path=None)
     l2_lambda = config['training']['loss_weights']['lambda_l2_scale']
     log_scale_target = config['training']['loss_weights']['log_scale_target']
 
+    BATCH_SIZE = config['training']['batch_size']
+
     profiler = PipelineProfiler(device)
 
     # --- 1. Data Setup ---
@@ -580,7 +582,7 @@ def train(stack_paths=None, mask_paths=None, config=None, output_file_path=None)
             gs.initialize_parameters_from_image(imgs, affines, lambda_init=0.0, device=device)
         gs.to(device)
         print(f"Training on device: {device}")
-        gs = torch.compile(gs, mode="reduce-overhead") # Can add this back for speed
+        gs = torch.compile(gs, mode="reduce-overhead" if len(values_np) <= BATCH_SIZE else "default")
 
     with profiler.stage("Init optimizer"):
         optimizer, scheduler, grad_scaler = _init_optim(gs, MC, SLICE_SCALING, SLICE_UNCERTAINTY, max_epochs, lrs)
@@ -605,62 +607,90 @@ def train(stack_paths=None, mask_paths=None, config=None, output_file_path=None)
 
     # --- 6. Training Loop ---
     with profiler.stage("Training loop"):
+        N = coords_wrld.shape[0]
         t0 = time.time()
         total_time = 0
         for i in range(max_epochs):
-            # batches
-            batch_coords_wrld = coords_wrld.contiguous()
-            batch_slice_centers_wrld = slice_centers_wrld
-            batch_values = values
-            batch_Sigma_psf = Sigma_psf
-            batch_slice_ids = slice_ids
-
-            loss_history = {'sr': [], 'sr_reg': [], 'mc': []}
             optimizer.zero_grad()
+
+            # --- Compute loss_sr_reg once (depends only on model params, not data) ---
             with torch.amp.autocast(device_type=device.type):
-                if MC and batch_slice_centers_wrld is not None and batch_slice_ids is not None:
-                    batch_coords_wrld, batch_Sigma_psf_tf, batch_q, batch_t = gs.motion_correction_fused(batch_coords_wrld, batch_slice_ids, batch_slice_centers_wrld, Sigma_psf=batch_Sigma_psf)
-                    batch_Sigma_psf = batch_Sigma_psf_tf if batch_Sigma_psf_tf is not None else batch_Sigma_psf
-                else:
-                    batch_q = torch.tensor([0.0])
-                    batch_t = torch.tensor([0.0])
-                if i % TOP_K_EVERY == 0:
-                    gpu_index.reset()
-                    gpu_index.add(gs.mu.data)
-                    _, top_k_idcs = gpu_index.search(batch_coords_wrld, M_NEIGHBORS)
-                    batch_top_k_idcs = top_k_idcs
-                    if (top_k_idcs >= gs.num_gaussians).any() or (top_k_idcs < 0).any():
-                        print("Error: Faiss returned invalid indices!")
-                        top_k_idcs = torch.clamp(top_k_idcs, min=0, max=gs.num_gaussians-1)
-
-                color_pred, _, _ = gs(batch_coords_wrld, slice_ids=batch_slice_ids, slice_centers=batch_slice_centers_wrld, Sigma_psf=batch_Sigma_psf, top_k_idcs=batch_top_k_idcs)
-                if SLICE_SCALING:
-                    slice_scales = gs.slice_scaling
-                    slice_scales_softplus = torch.nn.functional.softplus(slice_scales)
-                    slice_scales_softplus = slice_scales_softplus / slice_scales_softplus.mean()
-                    color_pred = color_pred * slice_scales_softplus[batch_slice_ids]
-                if SLICE_UNCERTAINTY:
-                    slice_weights = gs.slice_weight[batch_slice_ids]
-                    sw_reg = 1e-1 * -(torch.log(slice_weights + 1e-8)).mean()
-                    l1_diff = torch.abs(color_pred - batch_values)
-                    loss_sr = (l1_diff * slice_weights).mean() + sw_reg
-                    l1_diff = l1_diff.mean()
-                else:
-                    loss_sr = loss_fn(color_pred, batch_values)
-                    l1_diff = loss_sr
-                loss_mc = (batch_q**2).mean() + (batch_t**2).mean()
                 loss_sr_reg = l2_lambda * ((gs.scaling - log_scale_target)**2).mean()
-                loss = loss_sr + loss_sr_reg
+            grad_scaler.scale(loss_sr_reg).backward()
 
-            loss_history['sr'].append(l1_diff.item())
-            loss_history['sr_reg'].append(loss_sr_reg.item())
-            loss_history['mc'].append(loss_mc.item())
-            grad_scaler.scale(loss).backward()
+            # --- FAISS search (batched query, full result stored) ---
+            if i % TOP_K_EVERY == 0:
+                gpu_index.reset()
+                gpu_index.add(gs.mu.data)
+                top_k_idcs = torch.empty((N, M_NEIGHBORS), dtype=torch.long, device=device)
+                for b_start in range(0, N, BATCH_SIZE):
+                    b_end = min(b_start + BATCH_SIZE, N)
+                    _, top_k_idcs[b_start:b_end] = gpu_index.search(coords_wrld[b_start:b_end].contiguous(), M_NEIGHBORS)
+                if (top_k_idcs >= gs.num_gaussians).any() or (top_k_idcs < 0).any():
+                    print("Error: Faiss returned invalid indices!")
+                    top_k_idcs = torch.clamp(top_k_idcs, min=0, max=gs.num_gaussians - 1)
+
+            # --- Mini-batch forward/loss/backward ---
+            epoch_loss_sr = 0.0
+            epoch_loss_sr_reg = loss_sr_reg.item()
+            epoch_loss_mc = 0.0
+
+            for b_start in range(0, N, BATCH_SIZE):
+                torch.compiler.cudagraph_mark_step_begin()
+                b_end = min(b_start + BATCH_SIZE, N)
+                scale = (b_end - b_start) / N
+
+                b_coords = coords_wrld[b_start:b_end].contiguous()
+                b_values = values[b_start:b_end]
+                b_slice_ids = slice_ids[b_start:b_end] if MC else None
+                b_slice_centers = slice_centers_wrld[b_start:b_end] if MC else None
+                b_Sigma_psf = Sigma_psf[b_start:b_end] if PSF else None
+                b_top_k = top_k_idcs[b_start:b_end]
+
+                with torch.amp.autocast(device_type=device.type):
+                    # Motion correction per mini-batch
+                    if MC and b_slice_centers is not None:
+                        b_coords, b_Sigma_psf_tf, batch_q, batch_t = gs.motion_correction_fused(
+                            b_coords, b_slice_ids, b_slice_centers, Sigma_psf=b_Sigma_psf)
+                        b_Sigma_psf = b_Sigma_psf_tf if b_Sigma_psf_tf is not None else b_Sigma_psf
+                    else:
+                        batch_q = torch.tensor([0.0])
+                        batch_t = torch.tensor([0.0])
+
+                    color_pred, _, _ = gs(b_coords, slice_ids=b_slice_ids, slice_centers=b_slice_centers, Sigma_psf=b_Sigma_psf, top_k_idcs=b_top_k)
+
+                    if SLICE_SCALING:
+                        slice_scales = gs.slice_scaling
+                        slice_scales_softplus = torch.nn.functional.softplus(slice_scales)
+                        slice_scales_softplus = slice_scales_softplus / slice_scales_softplus.mean()
+                        color_pred = color_pred * slice_scales_softplus[b_slice_ids]
+
+                    if SLICE_UNCERTAINTY:
+                        slice_weights = gs.slice_weight[b_slice_ids]
+                        sw_reg = 1e-1 * -(torch.log(slice_weights + 1e-8)).mean()
+                        l1_diff = torch.abs(color_pred - b_values)
+                        loss_sr = (l1_diff * slice_weights).mean() + sw_reg
+                        l1_diff = l1_diff.mean()
+                    else:
+                        loss_sr = loss_fn(color_pred, b_values)
+                        l1_diff = loss_sr
+
+                    loss_mc = (batch_q**2).mean() + (batch_t**2).mean()
+                    loss = loss_sr
+
+                # Scale loss for gradient accumulation
+                (grad_scaler.scale(loss) * scale).backward()
+
+                # Accumulate for logging
+                epoch_loss_sr += l1_diff.item() * scale
+                epoch_loss_mc += loss_mc.item() * scale
+
+            # Step once per epoch (outside mini-batch loop)
             grad_scaler.step(optimizer)
             grad_scaler.update()
             gs.color.data.clamp_(min=0.0, max=None)
 
-            loss_mean = {'sr': np.array(loss_history['sr']).mean(), 'sr_reg': np.array(loss_history['sr_reg']).mean(), 'mc': np.array(loss_history['mc']).mean()}
+            loss_mean = {'sr': epoch_loss_sr, 'sr_reg': epoch_loss_sr_reg, 'mc': epoch_loss_mc}
             if scheduler is not None:
                 scheduler.step() # Step scheduler once per epoch
             if i == 0:
@@ -744,7 +774,7 @@ def load_data(stack_paths=None, mask_paths=None, slice_thickness=None, psf_scale
     for i, stack in enumerate(stacks_img):
         # load images
         stack_img = nib.load(stack)
-        if len(stacks_mask) > 0:
+        if use_masks and len(stacks_mask) > 0:
             stack_mask_data = (nib.load(stacks_mask[i]).get_fdata()>0).astype(np.int32).squeeze()
         elif use_masks:
             stack_mask_data = (stack_img.get_fdata() > 0.00).astype(np.int32)
